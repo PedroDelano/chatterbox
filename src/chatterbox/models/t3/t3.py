@@ -22,6 +22,7 @@ from .modules.learned_pos_emb import LearnedPositionEmbeddings
 from .modules.t3_config import T3Config
 
 logger = logging.getLogger(__name__)
+SPEECH_VOCAB_SIZE = 6561
 
 
 def _ensure_BOT_EOT(text_tokens: Tensor, hp):
@@ -341,7 +342,7 @@ class T3(nn.Module):
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
+            output_attentions=False,  # Changed to False - SDPA doesn't support True
             output_hidden_states=True,
             return_dict=True,
         )
@@ -365,9 +366,18 @@ class T3(nn.Module):
                 logits = logits / temperature
 
             # Apply repetition penalty and top‑p filtering.
-            logits = repetition_penalty_processor(generated_ids, logits)
+            try:
+                logits = repetition_penalty_processor(generated_ids, logits)
+            except Exception as e:
+                logger.warning(f"Error in repetition penalty processor: {e}")
+                # Continue without repetition penalty if it fails
+
             logits = min_p_warper(None, logits)
             logits = top_p_warper(None, logits)
+
+            # Mask out invalid tokens to prevent generation of out-of-bounds tokens
+            if logits.size(-1) > self.hp.speech_tokens_dict_size:
+                logits[..., self.hp.speech_tokens_dict_size :] = float("-inf")
 
             # Convert logits to probabilities and sample the next token.
             probs = torch.softmax(logits, dim=-1)
@@ -381,9 +391,21 @@ class T3(nn.Module):
                 break
 
             # Get embedding for the new token.
-            next_token_embed = self.speech_emb(next_token)
+            # Ensure token is within embedding bounds
+            clamped_token = torch.clamp(
+                next_token, 0, self.speech_emb.num_embeddings - 1
+            )
+            if not torch.equal(clamped_token, next_token):
+                logger.warning(
+                    f"Token {next_token.item()} clamped to {clamped_token.item()}"
+                )
+
+            next_token_embed = self.speech_emb(clamped_token)
             next_token_embed = (
-                next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+                next_token_embed
+                + self.speech_pos_emb.get_fixed_embedding(
+                    min(i + 1, self.speech_pos_emb.emb.num_embeddings - 1)
+                )
             )
 
             #  For CFG
@@ -394,7 +416,7 @@ class T3(nn.Module):
             output = self.patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
+                output_attentions=False,  # Changed to False - SDPA doesn't support True
                 output_hidden_states=True,
                 return_dict=True,
             )
@@ -404,3 +426,292 @@ class T3(nn.Module):
         # Concatenate all predicted tokens along the sequence dimension.
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
         return predicted_tokens
+
+    @torch.inference_mode()
+    def streaming_inference(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        s3gen_model,  # S3Gen model for audio generation
+        ref_dict: dict,  # Reference dictionary for S3Gen
+        chunk_size: int = 25,  # Number of tokens per audio chunk
+        overlap_size: int = 5,  # Number of overlapping tokens between chunks
+        min_tokens_for_audio: int = 10,  # Minimum tokens needed before generating audio
+        initial_speech_tokens: Optional[Tensor] = None,
+        # HF generate args
+        max_new_tokens=None,
+        stop_on_eos=True,
+        do_sample=True,
+        temperature=0.8,
+        min_p=0.05,
+        top_p=1.00,
+        repetition_penalty=1.2,
+        cfg_weight=0,
+    ):
+        """
+        Streaming inference that yields audio chunks as tokens are generated.
+
+        Args:
+            t3_cond: T3 conditioning data
+            text_tokens: Input text tokens
+            s3gen_model: S3Gen model for converting tokens to audio
+            ref_dict: Reference dictionary for S3Gen conditioning
+            chunk_size: Number of tokens to accumulate before generating audio
+            overlap_size: Number of tokens to overlap between chunks for smooth audio
+            min_tokens_for_audio: Minimum number of tokens needed before first audio generation
+            initial_speech_tokens: Optional initial speech tokens
+            **kwargs: Standard generation parameters
+
+        Yields:
+            torch.Tensor: Audio chunks as they are generated
+        """
+        # Validate / sanitize inputs
+        _ensure_BOT_EOT(text_tokens, self.hp)
+        text_tokens = torch.atleast_2d(text_tokens).to(
+            dtype=torch.long, device=self.device
+        )
+
+        # Default initial speech to a single start-of-speech token
+        if initial_speech_tokens is None:
+            initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(
+                text_tokens[:, :1]
+            )
+
+        # Prepare custom input embeds
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech_tokens,
+            cfg_weight=cfg_weight,
+        )
+
+        # Prepare the patched model if needed
+        if self.patched_model is None:
+            patched_model = T3HuggingfaceBackend(
+                config=self.cfg,
+                llama=self.tfmr,
+                speech_enc=self.speech_emb,
+                speech_head=self.speech_head,
+                alignment_stream_analyzer=None,
+            )
+            self.patched_model = patched_model
+
+        device = embeds.device
+        max_new_tokens = max_new_tokens or self.hp.max_speech_tokens
+
+        bos_token = torch.tensor(
+            [[self.hp.start_speech_token]], dtype=torch.long, device=device
+        )
+        bos_embed = self.speech_emb(bos_token)  # shape: (B, 1, embed_dim)
+        bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
+
+        # batch_size=2 for CFG
+        if cfg_weight > 0:
+            bos_embed = torch.cat([bos_embed, bos_embed])
+            inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+        else:
+            inputs_embeds = embeds
+
+        # Track generated token ids; start with the BOS token.
+        generated_ids = bos_token.clone()
+        all_generated_tokens = []  # Store all tokens for audio generation
+        last_audio_end_idx = 0  # Track where the last audio chunk ended
+
+        # Instantiate the logits processors.
+        min_p_warper = MinPLogitsWarper(min_p=min_p)
+        top_p_warper = TopPLogitsWarper(top_p=top_p)
+        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(
+            penalty=float(repetition_penalty)
+        )
+
+        # ---- Initial Forward Pass (no kv_cache yet) ----
+        output = self.patched_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=None,
+            use_cache=True,
+            output_attentions=False,  # Changed to False - SDPA doesn't support True
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        # Initialize kv_cache with the full context.
+        past = output.past_key_values
+
+        # Get max position embedding size for bounds checking
+        max_pos_embedding = self.speech_pos_emb.emb.num_embeddings - 1
+        max_speech_embedding = self.speech_emb.num_embeddings - 1
+
+        logger.info(
+            f"Max position embedding: {max_pos_embedding}, Max speech embedding: {max_speech_embedding}"
+        )
+        logger.info(f"Speech tokens dict size: {self.hp.speech_tokens_dict_size}")
+        logger.info(
+            f"Start token: {self.hp.start_speech_token}, Stop token: {self.hp.stop_speech_token}"
+        )
+
+        # ---- Generation Loop using kv_cache ----
+        for i in tqdm(range(max_new_tokens), desc="Streaming TTS", dynamic_ncols=True):
+            logits = output.logits[:, -1, :]
+
+            # CFG
+            if cfg_weight > 0.0:
+                logits_cond = logits[0:1]
+                logits_uncond = logits[1:2]
+                logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+
+            logits = logits.squeeze(1)
+
+            # Apply temperature scaling.
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            # Apply repetition penalty and top‑p filtering.
+            try:
+                logits = repetition_penalty_processor(generated_ids, logits)
+            except Exception as e:
+                logger.warning(f"Error in repetition penalty processor: {e}")
+
+            logits = min_p_warper(None, logits)
+            logits = top_p_warper(None, logits)
+
+            # Mask out invalid tokens
+            if logits.size(-1) > self.hp.speech_tokens_dict_size:
+                logits[..., self.hp.speech_tokens_dict_size :] = float("-inf")
+
+            # Convert logits to probabilities and sample the next token.
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # shape: (B, 1)
+
+            # Validate token is within vocabulary
+            if next_token.item() >= self.hp.speech_tokens_dict_size:
+                logger.warning(
+                    f"Generated token {next_token.item()} exceeds vocabulary size {self.hp.speech_tokens_dict_size}"
+                )
+                next_token = torch.tensor([[self.hp.stop_speech_token]], device=device)
+
+            # Ensure token is non-negative
+            if next_token.item() < 0:
+                logger.warning(
+                    f"Generated negative token {next_token.item()}, setting to start token"
+                )
+                next_token = torch.tensor([[self.hp.start_speech_token]], device=device)
+
+            all_generated_tokens.append(next_token.item())
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            # Check for EOS token BEFORE filtering (this is important!)
+            if stop_on_eos and next_token.view(-1) == self.hp.stop_speech_token:
+                # Generate final audio chunk with remaining tokens
+                if len(all_generated_tokens) > last_audio_end_idx:
+                    try:
+                        remaining_tokens = all_generated_tokens[last_audio_end_idx:]
+                        valid_remaining = [
+                            token
+                            for token in remaining_tokens
+                            if token < SPEECH_VOCAB_SIZE
+                        ]
+
+                        if valid_remaining:
+                            remaining_tensor = torch.tensor(
+                                valid_remaining, dtype=torch.long, device=device
+                            ).unsqueeze(0)
+
+                            wav, _ = s3gen_model.inference(
+                                speech_tokens=remaining_tensor,
+                                ref_dict=ref_dict,
+                            )
+                            yield wav.squeeze(0).detach().cpu()
+                    except Exception as e:
+                        logger.warning(f"Failed to generate final audio chunk: {e}")
+                break  # This break is crucial!
+
+            # Generate audio chunk when we have enough tokens
+            tokens_available = len(all_generated_tokens)
+            if (
+                tokens_available >= min_tokens_for_audio
+                and tokens_available - last_audio_end_idx >= chunk_size
+            ):
+                try:
+                    # Determine the range of tokens for this chunk
+                    chunk_start = max(0, last_audio_end_idx - overlap_size)
+                    chunk_end = min(
+                        last_audio_end_idx + chunk_size, len(all_generated_tokens)
+                    )
+
+                    # Extract tokens for this chunk
+                    chunk_tokens = all_generated_tokens[chunk_start:chunk_end]
+
+                    valid_tokens = [
+                        token for token in chunk_tokens if token < SPEECH_VOCAB_SIZE
+                    ]
+
+                    # Only proceed if we have valid tokens
+                    if not valid_tokens:
+                        logger.warning(
+                            "No valid tokens in chunk, skipping audio generation"
+                        )
+                        last_audio_end_idx = chunk_end
+                        continue
+
+                    # Create tensor WITHOUT any start token
+                    chunk_tensor = torch.tensor(
+                        valid_tokens, dtype=torch.long, device=device
+                    ).unsqueeze(0)
+
+                    # Generate audio for this chunk
+                    wav, _ = s3gen_model.inference(
+                        speech_tokens=chunk_tensor,
+                        ref_dict=ref_dict,
+                    )
+
+                    # Handle overlap trimming if needed...
+                    if chunk_start < last_audio_end_idx and last_audio_end_idx > 0:
+                        overlap_tokens = last_audio_end_idx - chunk_start
+                        overlap_samples = int(overlap_tokens * 24000 / 25)
+                        if overlap_samples < wav.shape[-1]:
+                            wav = wav[..., overlap_samples:]
+
+                    yield wav.squeeze(0).detach().cpu()
+                    last_audio_end_idx = chunk_end
+
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to generate audio chunk at token {tokens_available}: {e}"
+                    )
+                    import traceback
+
+                    traceback.print_exc()
+                    # Continue generation even if audio generation fails
+
+            # Get embedding for the new token with bounds checking
+            # Ensure token is within embedding bounds
+            clamped_token = torch.clamp(
+                next_token, 0, self.speech_emb.num_embeddings - 1
+            )
+            if not torch.equal(clamped_token, next_token):
+                logger.warning(
+                    f"Token {next_token.item()} clamped to {clamped_token.item()} for speech embedding"
+                )
+
+            next_token_embed = self.speech_emb(clamped_token)
+
+            # Bounds check for position embeddings
+            pos_idx = min(i + 1, max_pos_embedding)
+            next_token_embed = (
+                next_token_embed + self.speech_pos_emb.get_fixed_embedding(pos_idx)
+            )
+
+            #  For CFG
+            if cfg_weight > 0.0:
+                next_token_embed = torch.cat([next_token_embed, next_token_embed])
+
+            # Forward pass with only the new token and the cached past.
+            output = self.patched_model(
+                inputs_embeds=next_token_embed,
+                past_key_values=past,
+                output_attentions=False,  # Changed to False - SDPA doesn't support True
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # Update the kv_cache.
+            past = output.past_key_values

@@ -230,9 +230,9 @@ class ChatterboxTTS:
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
-            assert (
-                self.conds is not None
-            ), "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            assert self.conds is not None, (
+                "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            )
 
         # Update exaggeration if needed
         if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
@@ -285,3 +285,89 @@ class ChatterboxTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def streaming_generate(
+        self,
+        text,
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        chunk_size=25,
+        overlap_size=5,
+        min_tokens_for_audio=10,
+    ):
+        """
+        Generate audio in streaming chunks as the model generates tokens.
+
+        Args:
+            text: Input text to synthesize
+            repetition_penalty: Penalty for token repetition
+            min_p: Minimum probability threshold for sampling
+            top_p: Top-p sampling threshold
+            audio_prompt_path: Path to reference audio for voice cloning
+            exaggeration: Emotion exaggeration level (0.0 to 1.0)
+            cfg_weight: Classifier-free guidance weight
+            temperature: Sampling temperature
+            chunk_size: Number of tokens per audio chunk
+            overlap_size: Number of overlapping tokens between chunks
+            min_tokens_for_audio: Minimum tokens before first audio generation
+
+        Yields:
+            torch.Tensor: Audio chunks as they are generated
+        """
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, (
+                "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+            )
+
+        # Update exaggeration if needed
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat(
+                [text_tokens, text_tokens], dim=0
+            )  # Need two seqs for CFG
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        with torch.inference_mode():
+            # Use the streaming inference method
+            for audio_chunk in self.t3.streaming_inference(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                s3gen_model=self.s3gen,
+                ref_dict=self.conds.gen,
+                max_new_tokens=1000,  # TODO: use the value in config
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                chunk_size=chunk_size,
+                overlap_size=overlap_size,
+                min_tokens_for_audio=min_tokens_for_audio,
+            ):
+                # Apply watermarking to each chunk
+                watermarked_chunk = self.watermarker.apply_watermark(
+                    audio_chunk.numpy(), sample_rate=self.sr
+                )
+                yield torch.from_numpy(watermarked_chunk).unsqueeze(0)
