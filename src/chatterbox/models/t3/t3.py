@@ -26,12 +26,12 @@ logger = logging.getLogger(__name__)
 
 def _ensure_BOT_EOT(text_tokens: Tensor, hp):
     B = text_tokens.size(0)
-    assert (
-        text_tokens == hp.start_text_token
-    ).int().sum() >= B, "missing start_text_token"
-    assert (
-        text_tokens == hp.stop_text_token
-    ).int().sum() >= B, "missing stop_text_token"
+    assert (text_tokens == hp.start_text_token).int().sum() >= B, (
+        "missing start_text_token"
+    )
+    assert (text_tokens == hp.stop_text_token).int().sum() >= B, (
+        "missing stop_text_token"
+    )
 
 
 class T3(nn.Module):
@@ -51,6 +51,7 @@ class T3(nn.Module):
         self.tfmr = LlamaModel(self.cfg)
         self.dim = self.cfg.hidden_size
         self.deepspeed_patch_applied = False
+        self.patched_model = None
 
         # conditioning / embedding
         self.cond_enc = T3CondEnc(hp)
@@ -279,7 +280,7 @@ class T3(nn.Module):
 
         # TODO? synchronize the expensive compile function
         # with self.compile_lock:
-        if not self.compiled:
+        if self.patched_model is None:
             patched_model = T3HuggingfaceBackend(
                 config=self.cfg,
                 llama=self.tfmr,
