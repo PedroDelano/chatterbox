@@ -3,7 +3,6 @@ import logging
 import torch
 from tokenizers import Tokenizer
 
-
 # Special tokens
 SOT = "[START]"
 EOT = "[STOP]"
@@ -12,6 +11,7 @@ SPACE = "[SPACE]"
 SPECIAL_TOKENS = [SOT, EOT, UNK, SPACE, "[PAD]", "[SEP]", "[CLS]", "[MASK]"]
 
 logger = logging.getLogger(__name__)
+
 
 class EnTokenizer:
     def __init__(self, vocab_file_path):
@@ -28,11 +28,11 @@ class EnTokenizer:
         text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
         return text_tokens
 
-    def encode( self, txt: str, verbose=False):
+    def encode(self, txt: str, verbose=False):
         """
         clean_text > (append `lang_id`) > replace SPACE > encode text using Tokenizer
         """
-        txt = txt.replace(' ', SPACE)
+        txt = txt.replace(" ", SPACE)
         code = self.tokenizer.encode(txt)
         ids = code.ids
         return ids
@@ -41,10 +41,9 @@ class EnTokenizer:
         if isinstance(seq, torch.Tensor):
             seq = seq.cpu().numpy()
 
-        txt: str = self.tokenizer.decode(seq,
-        skip_special_tokens=False)
-        txt = txt.replace(' ', '')
-        txt = txt.replace(SPACE, ' ')
-        txt = txt.replace(EOT, '')
-        txt = txt.replace(UNK, '')
+        txt: str = self.tokenizer.decode(seq, skip_special_tokens=False)
+        txt = txt.replace(" ", "")
+        txt = txt.replace(SPACE, " ")
+        txt = txt.replace(EOT, "")
+        txt = txt.replace(UNK, "")
         return txt

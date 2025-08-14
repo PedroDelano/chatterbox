@@ -1,15 +1,18 @@
-import torch
 import gradio as gr
-from chatterbox.vc import ChatterboxVC
+import torch
 
+from chatterbox.vc import ChatterboxVC
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 model = ChatterboxVC.from_pretrained(DEVICE)
+
+
 def generate(audio, target_voice_path):
     wav = model.generate(
-        audio, target_voice_path=target_voice_path,
+        audio,
+        target_voice_path=target_voice_path,
     )
     return model.sr, wav.squeeze(0).numpy()
 
@@ -17,8 +20,15 @@ def generate(audio, target_voice_path):
 demo = gr.Interface(
     generate,
     [
-        gr.Audio(sources=["upload", "microphone"], type="filepath", label="Input audio file"),
-        gr.Audio(sources=["upload", "microphone"], type="filepath", label="Target voice audio file (if none, the default voice is used)", value=None),
+        gr.Audio(
+            sources=["upload", "microphone"], type="filepath", label="Input audio file"
+        ),
+        gr.Audio(
+            sources=["upload", "microphone"],
+            type="filepath",
+            label="Target voice audio file (if none, the default voice is used)",
+            value=None,
+        ),
     ],
     "audio",
 )

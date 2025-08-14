@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 from torch import nn as nn
-from transformers import LlamaConfig, LlamaModel, LlamaPreTrainedModel, GenerationMixin
+from transformers import GenerationMixin, LlamaConfig, LlamaModel, LlamaPreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 
@@ -23,7 +23,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         speech_head,
         latents_queue=None,
         logits_queue=None,
-        alignment_stream_analyzer: 'AlignmentStreamAnalyzer'=None,
+        alignment_stream_analyzer: "AlignmentStreamAnalyzer" = None,
     ):
         super().__init__(config)
         self.model = llama
@@ -34,9 +34,13 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
 
     @torch.inference_mode()
     def prepare_inputs_for_generation(
-        self, input_ids: torch.Tensor, decoder_cond: torch.Tensor, use_cache: bool, past_key_values=None,
+        self,
+        input_ids: torch.Tensor,
+        decoder_cond: torch.Tensor,
+        use_cache: bool,
+        past_key_values=None,
         # This argument was introduced in some recent version of transformers (>=4.29.1)
-        cache_position=None
+        cache_position=None,
     ):
         """
         This is a method used by huggingface's generate() method.
@@ -57,7 +61,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
 
         # prefix decoder conditioning if applicable
         if not self._added_cond:
-            assert past_key_values is not None # should be first step
+            assert past_key_values is not None  # should be first step
             if decoder_cond.size(0) != inputs_embeds.size(0):
                 decoder_cond = decoder_cond.expand(inputs_embeds.size(0), -1, -1)
             inputs_embeds = torch.cat([decoder_cond, inputs_embeds], dim=1)
@@ -73,7 +77,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        past_key_values: Optional[torch.Tensor]=None,
+        past_key_values: Optional[torch.Tensor] = None,
         use_cache=True,
         output_attentions=False,
         output_hidden_states=True,

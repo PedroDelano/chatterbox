@@ -1,8 +1,7 @@
 """mel-spectrogram extraction in Matcha-TTS"""
-from librosa.filters import mel as librosa_mel_fn
-import torch
 import numpy as np
-
+import torch
+from librosa.filters import mel as librosa_mel_fn
 
 # NOTE: they decalred these global vars
 mel_basis = {}
@@ -17,6 +16,7 @@ def spectral_normalize_torch(magnitudes):
     output = dynamic_range_compression_torch(magnitudes)
     return output
 
+
 """
 feat_extractor: !name:matcha.utils.audio.mel_spectrogram
     n_fft: 1920
@@ -30,8 +30,18 @@ feat_extractor: !name:matcha.utils.audio.mel_spectrogram
 
 """
 
-def mel_spectrogram(y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=480, win_size=1920,
-                    fmin=0, fmax=8000, center=False):
+
+def mel_spectrogram(
+    y,
+    n_fft=1920,
+    num_mels=80,
+    sampling_rate=24000,
+    hop_size=480,
+    win_size=1920,
+    fmin=0,
+    fmax=8000,
+    center=False,
+):
     """Copied from https://github.com/shivammehta25/Matcha-TTS/blob/main/matcha/utils/audio.py
     Set default values according to Cosyvoice's config.
     """
@@ -40,7 +50,7 @@ def mel_spectrogram(y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=48
         y = torch.tensor(y).float()
 
     if len(y.shape) == 1:
-        y = y[None, ]
+        y = y[None,]
 
     if torch.min(y) < -1.0:
         print("min value is ", torch.min(y))
@@ -49,12 +59,18 @@ def mel_spectrogram(y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=48
 
     global mel_basis, hann_window  # pylint: disable=global-statement,global-variable-not-assigned
     if f"{str(fmax)}_{str(y.device)}" not in mel_basis:
-        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-        mel_basis[str(fmax) + "_" + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+        mel = librosa_mel_fn(
+            sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax
+        )
+        mel_basis[str(fmax) + "_" + str(y.device)] = (
+            torch.from_numpy(mel).float().to(y.device)
+        )
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
     y = torch.nn.functional.pad(
-        y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
+        y.unsqueeze(1),
+        (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)),
+        mode="reflect",
     )
     y = y.squeeze(1)
 
